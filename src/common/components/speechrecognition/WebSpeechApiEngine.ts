@@ -1,6 +1,6 @@
 import { Is } from '~/common/util/pwaUtils';
 
-import { createSpeechRecognitionResults, IRecognitionEngine, PLACEHOLDER_INTERIM_TRANSCRIPT, SpeechDoneReason, SpeechRecognitionState, SpeechResult } from './useSpeechRecognition';
+import { createSpeechRecognitionResults, IRecognitionEngine, PLACEHOLDER_INTERIM_TRANSCRIPT, SpeechDoneReason, SpeechRecognitionState, SpeechResult } from './speechRecognition.types';
 
 
 /**
@@ -198,6 +198,7 @@ export class WebSpeechApiEngine implements IRecognitionEngine {
   }
 
   stop(reason: SpeechDoneReason, sendOnDone: boolean) {
+    this._clearInactivityTimeout();
     this.results.doneReason = reason;
     this.results.flagSendOnDone = sendOnDone;
     this._api.stop();
@@ -308,4 +309,3 @@ interface ISpeechRecognitionEvent extends Event {
   // readonly resultIndex: number;
   readonly results: SpeechRecognitionResult[];
 }
-

@@ -1,10 +1,14 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
+import type { RecognitionEngineType } from '~/common/components/speechrecognition/speechRecognition.types';
 
 // Call settings
 
 interface AppCallStore {
+
+  recognitionEngine: RecognitionEngineType;
+  setRecognitionEngine: (recognitionEngine: RecognitionEngineType) => void;
 
   // end-of-turn: silence after the last recognized words before the sentence is sent (Web Speech has no such knob - this is our timer)
   sendAfterMs: number;
@@ -26,6 +30,9 @@ interface AppCallStore {
 
 export const useAppCallStore = create<AppCallStore>()(persist(
   (_set, _get) => ({
+
+    recognitionEngine: 'webSpeechApi',
+    setRecognitionEngine: (recognitionEngine) => _set({ recognitionEngine }),
 
     sendAfterMs: 2000,
     setSendAfterMs: (sendAfterMs: number) => _set({ sendAfterMs }),

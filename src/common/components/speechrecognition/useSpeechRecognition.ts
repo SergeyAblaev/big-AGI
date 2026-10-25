@@ -8,8 +8,9 @@ import { CapabilityBrowserSpeechRecognition } from '../useCapabilities';
 import { AudioRecorderEngine } from './AudioRecorderEngine';
 import { getSpeechRecognitionClass, WebSpeechApiEngine } from './WebSpeechApiEngine';
 
-// configuration
-export const PLACEHOLDER_INTERIM_TRANSCRIPT = 'Listening...';
+import type { IRecognitionEngine, RecognitionEngineType, SpeechRecognitionState, SpeechResult, SpeechResultCallback } from './speechRecognition.types';
+
+export { PLACEHOLDER_INTERIM_TRANSCRIPT, type SpeechResult } from './speechRecognition.types';
 
 
 /// Capability interface
@@ -35,60 +36,6 @@ export const browserSpeechRecognitionCapability = (): CapabilityBrowserSpeechRec
 };
 
 
-// Interfaces used by Engines
-
-type RecognitionEngineType = 'webSpeechApi' | 'audioRecorder';
-
-export interface IRecognitionEngine {
-  engineType: RecognitionEngineType;
-  start: () => void;
-  stop: (reason: SpeechDoneReason, sendOnDone: boolean) => void;
-  dispose: () => void;
-  isBetweenBeginEnd: () => boolean;
-  updateConfiguration: (language: string, softStopTimeout: number, onResultCallback: SpeechResultCallback) => void;
-}
-
-export interface SpeechResult {
-  transcript: string;             // the portion of the transcript that is finalized (or all the transcript if done)
-  interimTranscript: string;      // for the continuous (interim) listening, this is the current transcript
-  done: boolean;                  // true if the recognition is done - no more updates after this
-  doneReason: SpeechDoneReason;   // the reason why the recognition is done
-  flagSendOnDone: boolean | undefined; // user flags set on 'startRecognition' - passive
-}
-
-export function createSpeechRecognitionResults(): SpeechResult {
-  return {
-    transcript: '',
-    interimTranscript: PLACEHOLDER_INTERIM_TRANSCRIPT,
-    done: false,
-    doneReason: undefined,
-    flagSendOnDone: undefined,
-  };
-}
-
-export type SpeechDoneReason =
-  | undefined             // upon start: not done yet
-  | 'manual'              // user clicked the stop button
-  | 'continuous-deadline' // we hit our `softStopTimeout` while listening continuously
-  | 'api-unknown-timeout' // a timeout has occurred
-  | 'api-error'           // underlying .onerror
-  | 'api-no-speech'       // underlying .onerror, user did not speak
-  | 'switch-engine'       // the engine is switching
-  | 'react-unmount';      // the component is unmounting - the App shall never see this (set on unmount and not transmitted)
-
-
-export interface SpeechRecognitionState {
-  isAvailable: boolean;
-  isActive: boolean;
-  hasAudio: boolean;
-  hasSpeech: boolean;
-  errorMessage: string | null;
-  currentEngine: RecognitionEngineType;
-}
-
-type SpeechResultCallback = (result: SpeechResult) => void;
-
-
 /**
  * Hook for speech recognition that supports switching between engines.
  * @param onResultCallback - Callback when a result is received
@@ -105,6 +52,8 @@ export const useSpeechRecognition = (
   const [recognitionState, setRecognitionState] = React.useState<SpeechRecognitionState>({
     isAvailable: false,
     isActive: false,
+    isStarting: false,
+    isProcessing: false,
     hasAudio: false,
     hasSpeech: false,
     errorMessage: null,
@@ -127,6 +76,11 @@ export const useSpeechRecognition = (
     setRecognitionState((prevState) => ({ ...prevState, ...state }));
   }, []);
 
+  const emitResult = React.useCallback((result: SpeechResult) => {
+    if (result.doneReason === 'cancelled' || result.doneReason === 'switch-engine' || result.doneReason === 'react-unmount') return;
+    onResultCallbackRef.current(result);
+  }, []);
+
   // Params: update refs when params change
   React.useEffect(() => {
     // detect changes
@@ -141,8 +95,8 @@ export const useSpeechRecognition = (
     preferredLanguageRef.current = preferredLanguage;
 
     // update the values in the running instance
-    engineRef.current?.updateConfiguration(preferredLanguage, softStopTimeout, onResultCallback);
-  }, [onResultCallback, preferredLanguage, softStopTimeout]);
+    engineRef.current?.updateConfiguration(preferredLanguage, softStopTimeout, emitResult);
+  }, [emitResult, onResultCallback, preferredLanguage, softStopTimeout]);
 
   // Recreate the engine if the type changes (and upon load, and destroy it on unmount)
   React.useEffect(() => {
@@ -153,13 +107,15 @@ export const useSpeechRecognition = (
       return;
 
     if (engineRef.current) {
-      engineRef.current.stop('switch-engine', false);
+      engineRef.current.dispose();
       engineRef.current = null;
     }
 
     updateState({
       isAvailable: false,
       isActive: false,
+      isStarting: false,
+      isProcessing: false,
       hasAudio: false,
       hasSpeech: false,
       errorMessage: null,
@@ -186,17 +142,20 @@ export const useSpeechRecognition = (
           webSpeechAPI,
           preferredLanguageRef.current,
           softStopTimeoutRef.current,
-          onResultCallbackRef.current,
+          emitResult,
           updateState,
         );
         break;
 
       case 'audioRecorder':
         engineRef.current = new AudioRecorderEngine(
-          preferredLanguageRef.current,
           softStopTimeoutRef.current,
-          onResultCallbackRef.current,
+          emitResult,
           updateState,
+          async (audio, mimeType, signal) => {
+            const { asrxTranscribeBatch } = await import('~/modules/asrx/protocols/batch/batch.client');
+            return asrxTranscribeBatch(audio, mimeType, undefined, { signal });
+          },
         );
         break;
     }
@@ -208,7 +167,7 @@ export const useSpeechRecognition = (
         engineRef.current = null;
       }
     };
-  }, [engineType, updateState]);
+  }, [emitResult, engineType, updateState]);
 
 
   const startRecognition = React.useCallback(() => {
@@ -230,24 +189,28 @@ export const useSpeechRecognition = (
     engineRef.current.stop('manual', sendOnDone);
   }, []);
 
-  const hasError = !!recognitionState.errorMessage;
+  const cancelRecognition = React.useCallback(() => {
+    if (engineRef.current?.isBetweenBeginEnd())
+      engineRef.current.stop('cancelled', false);
+  }, []);
 
   const toggleRecognition = React.useCallback((sendOnDone?: boolean) => {
     if (!engineRef.current) return;
 
     // start or stop
-    if (hasError || engineRef.current?.isBetweenBeginEnd()) {
+    if (engineRef.current.isBetweenBeginEnd()) {
       stopRecognition(sendOnDone === true);
       updateState({ errorMessage: null });
     } else
       startRecognition();
-  }, [hasError, startRecognition, stopRecognition, updateState]);
+  }, [startRecognition, stopRecognition, updateState]);
 
 
   return {
     recognitionState,
     startRecognition,
     stopRecognition,
+    cancelRecognition,
     toggleRecognition,
   };
 };

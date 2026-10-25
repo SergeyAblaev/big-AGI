@@ -9,6 +9,7 @@ import MicIcon from '@mui/icons-material/Mic';
 import WarningRoundedIcon from '@mui/icons-material/WarningRounded';
 
 import { useSpeexGlobalEngine } from '~/modules/speex/store-module-speex';
+import { asrxAreCredentialsValid, useASRxGlobalEngine } from '~/modules/asrx/store-module-asrx';
 
 import { BaseProduct } from '~/common/app.release';
 import { PhVoice } from '~/common/components/icons/phosphor/PhVoice';
@@ -16,9 +17,11 @@ import { animationColorRainbow } from '~/common/util/animUtils';
 import { navigateBack } from '~/common/app.routes';
 import { optimaOpenPreferences } from '~/common/layout/optima/useOptima';
 import { useCapabilityBrowserSpeechRecognition } from '~/common/components/useCapabilities';
+import { browserAudioRecordingAvailable } from '~/common/components/speechrecognition/AudioRecorderEngine';
 import { useChatStore } from '~/common/stores/chat/store-chats';
 import { useUICounter } from '~/common/stores/store-ui';
 
+import { useAppCallStore } from './state/store-app-call';
 
 function StatusCard(props: { icon: React.JSX.Element, hasIssue: boolean, text: string, button?: React.JSX.Element }) {
   return (
@@ -48,6 +51,10 @@ export function CallWizard(props: { strict?: boolean, conversationId: string | n
 
   // external state
   const recognition = useCapabilityBrowserSpeechRecognition();
+  const recognitionEngine = useAppCallStore(state => state.recognitionEngine);
+  const transcriptionEngine = useASRxGlobalEngine();
+  const usesTranscription = recognitionEngine === 'audioRecorder';
+  const transcriptionReady = !!transcriptionEngine && asrxAreCredentialsValid(transcriptionEngine.credentials) && browserAudioRecordingAvailable();
   const speexGlobalEngine = useSpeexGlobalEngine();
   const chatIsEmpty = useChatStore(state => {
     if (!props.conversationId)
@@ -60,7 +67,7 @@ export function CallWizard(props: { strict?: boolean, conversationId: string | n
   // derived state
   const outOfTheBlue = !props.conversationId;
   const overriddenEmptyChat = outOfTheBlue || chatEmptyOverride || !chatIsEmpty;
-  const overriddenRecognition = recognitionOverride || recognition.mayWork;
+  const overriddenRecognition = recognitionOverride || (usesTranscription ? transcriptionReady : recognition.mayWork);
   const synthesisShallWork = !!speexGlobalEngine;
   const allGood = overriddenEmptyChat && overriddenRecognition && synthesisShallWork;
   const fatalGood = overriddenRecognition && synthesisShallWork;
@@ -117,12 +124,19 @@ export function CallWizard(props: { strict?: boolean, conversationId: string | n
     <StatusCard
       icon={<MicIcon />}
       text={
+        usesTranscription ? (transcriptionReady ? `${transcriptionEngine?.label} transcription is ready.` : 'Configure transcription in Voice Input and allow microphone recording.') :
         ((overriddenRecognition && !recognition.warnings.length) ? 'Speech recognition should be good to go.' : 'There might be a speech recognition issue.')
         + (recognition.isApiAvailable ? '' : ' Your browser does not support the speech recognition API.')
         + (recognition.isDeviceNotSupported ? ' Your device does not provide this feature.' : '')
         + (recognition.warnings.length ? ' ⚠️ ' + recognition.warnings.join(' · ') : '')
       }
       button={overriddenRecognition ? undefined : <>
+        <Button variant='outlined' onClick={() => useAppCallStore.getState().setRecognitionEngine(usesTranscription ? 'webSpeechApi' : 'audioRecorder')} sx={{ mx: 1 }}>
+          Use {usesTranscription ? 'browser' : 'transcription'}
+        </Button>
+        <Button variant='outlined' onClick={() => optimaOpenPreferences('voice-in')} sx={{ mx: 1 }}>
+          Configure input
+        </Button>
         <Button variant='outlined' component='a' href={BaseProduct.DocsBaseSite + '/feature-voice'} target='_blank' sx={{ ml: 1 }}>
           How to fix
         </Button>

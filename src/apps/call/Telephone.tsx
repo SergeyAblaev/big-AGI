@@ -2,7 +2,7 @@ import * as React from 'react';
 import { useShallow } from 'zustand/react/shallow';
 
 import type { SxProps } from '@mui/joy/styles/types';
-import { Box, Card, Checkbox, Chip, ListItem, ListItemDecorator, MenuItem, Typography } from '@mui/joy';
+import { Box, Button, Card, Checkbox, Chip, ListItem, ListItemDecorator, MenuItem, Typography } from '@mui/joy';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import CallEndIcon from '@mui/icons-material/CallEnd';
 import CallIcon from '@mui/icons-material/Call';
@@ -18,13 +18,16 @@ import { SystemPurposeId, SystemPurposes } from '../../data';
 
 import { aixChatGenerateContent_DMessage_FromConversation, AixChatGenerateContent_DMessageGuts } from '~/modules/aix/client/aix.client';
 import { speakText } from '~/modules/speex/speex.client';
+import { asrxAreCredentialsValid, useASRxGlobalEngine } from '~/modules/asrx/store-module-asrx';
 
 import type { FormRadioOption } from '~/common/components/forms/FormRadioControl';
+import type { RecognitionEngineType } from '~/common/components/speechrecognition/speechRecognition.types';
 import type { OptimaBarControlMethods } from '~/common/layout/optima/bar/OptimaBarDropdown';
 import { AudioPlayer } from '~/common/util/audio/AudioPlayer';
 import { FormChipGroupControl } from '~/common/components/forms/FormChipGroupControl';
 import { OptimaPanelGroupedList } from '~/common/layout/optima/panel/OptimaPanelGroupedList';
 import { OptimaPanelIn, OptimaToolbarIn } from '~/common/layout/optima/portals/OptimaPortalsIn';
+import { optimaOpenPreferences } from '~/common/layout/optima/useOptima';
 import { SpeechResult, useSpeechRecognition } from '~/common/components/speechrecognition/useSpeechRecognition';
 import { clipboardInterceptCtrlCForCleanup } from '~/common/util/clipboardUtils';
 import { conversationTitle, remapMessagesSysToUsr } from '~/common/stores/chat/chat.conversation';
@@ -57,6 +60,11 @@ const _micModeOptions: ReadonlyArray<FormRadioOption<'ptt' | 'always'>> = [
   { value: 'ptt', label: 'Push to talk', description: 'Click' },
   { value: 'always', label: 'Always on', description: 'Mic stays on' },
 ] as const;
+
+const _recognitionEngineOptions: ReadonlyArray<FormRadioOption<RecognitionEngineType>> = [
+  { value: 'webSpeechApi', label: 'Browser' },
+  { value: 'audioRecorder', label: 'Transcription' },
+];
 
 
 // notice under a row, same look as the Beam 'model unavailable' chip
@@ -93,11 +101,18 @@ const _chipRowEndSx: SxProps = {
 function CallMenu(props: {
   pushToTalk: boolean,
   setPushToTalk: (pushToTalk: boolean) => void,
+  micBusy: boolean,
 }) {
 
   // external state
-  const { grayUI, toggleGrayUI, sendAfterMs, setSendAfterMs, sendAfterMode, setSendAfterMode } = useAppCallStore();
+  const { grayUI, toggleGrayUI, sendAfterMs, setSendAfterMs, sendAfterMode, setSendAfterMode, recognitionEngine, setRecognitionEngine } = useAppCallStore(useShallow(state => ({
+    grayUI: state.grayUI, toggleGrayUI: state.toggleGrayUI,
+    sendAfterMs: state.sendAfterMs, setSendAfterMs: state.setSendAfterMs,
+    sendAfterMode: state.sendAfterMode, setSendAfterMode: state.setSendAfterMode,
+    recognitionEngine: state.recognitionEngine, setRecognitionEngine: state.setRecognitionEngine,
+  })));
   const chatMicTimeoutMs = useChatMicTimeoutMsValue();
+  const transcriptionEngine = useASRxGlobalEngine();
 
   // derived: the Settings chip shows the value it follows
   const sendAfterModeOptions = React.useMemo((): ReadonlyArray<FormRadioOption<'global' | 'custom'>> => [
@@ -115,6 +130,25 @@ function CallMenu(props: {
     </OptimaPanelGroupedList>
 
     <OptimaPanelGroupedList title='Microphone'>
+
+      <ListItem sx={_chipRowSx}>
+        <FormChipGroupControl
+          size='sm'
+          title='Recognition'
+          description={recognitionEngine === 'audioRecorder' ? transcriptionEngine?.label ?? 'Configure Voice Input' : 'Browser speech recognition'}
+          renderVariant='solid'
+          options={_recognitionEngineOptions}
+          value={recognitionEngine}
+          onChange={setRecognitionEngine}
+          disabled={props.micBusy}
+        />
+      </ListItem>
+      {recognitionEngine === 'audioRecorder' && (
+        <ListItem sx={{ pl: 1.25, flexDirection: 'column', alignItems: 'flex-start', gap: 0.5 }}>
+          <Typography level='body-xs'>Text appears after each turn. Uses the model, language and dictionary from Voice Input.</Typography>
+          <Button size='sm' variant='plain' onClick={() => optimaOpenPreferences('voice-in')}>Configure transcription</Button>
+        </ListItem>
+      )}
 
       <ListItem sx={_chipRowSx}>
         <FormChipGroupControl
@@ -208,7 +242,11 @@ export function Telephone(props: {
   }, []);
   const chatMicTimeoutMs = useChatMicTimeoutMsValue();
   const { sendAfterMs, sendAfterMode } = useAppCallStore(useShallow(state => ({ sendAfterMs: state.sendAfterMs, sendAfterMode: state.sendAfterMode })));
-  const { recognitionState, startRecognition, stopRecognition, toggleRecognition } = useSpeechRecognition('webSpeechApi', onSpeechResultCallback, (sendAfterMode === 'global' ? chatMicTimeoutMs : sendAfterMs) || 2000);
+  const recognitionEngine = useAppCallStore(state => state.recognitionEngine);
+  const transcriptionEngine = useASRxGlobalEngine();
+  const transcriptionReady = !!transcriptionEngine && asrxAreCredentialsValid(transcriptionEngine.credentials);
+  const { recognitionState, startRecognition, cancelRecognition, toggleRecognition } = useSpeechRecognition(recognitionEngine, onSpeechResultCallback, (sendAfterMode === 'global' ? chatMicTimeoutMs : sendAfterMs) || 2000);
+  const isMicEnabled = recognitionState.isAvailable && (recognitionEngine !== 'audioRecorder' || transcriptionReady);
 
   // derived state
   const isRinging = stage === 'ring';
@@ -230,16 +268,25 @@ export function Telephone(props: {
 
   /// Shortcuts
 
+  const handleToggleRecognition = React.useCallback(() => {
+    if (isConnected && isMicEnabled) toggleRecognition();
+  }, [isConnected, isMicEnabled, toggleRecognition]);
+
   useGlobalShortcuts('Telephone', React.useMemo(() => [
-    { key: 'm', ctrl: true, action: toggleRecognition },
-  ], [toggleRecognition]));
+    { key: 'm', ctrl: true, action: handleToggleRecognition },
+  ], [handleToggleRecognition]));
 
   /// CONNECTED
 
   const handleCallStop = () => {
-    stopRecognition(false);
+    cancelRecognition();
     setStage('ended');
   };
+
+  React.useEffect(() => {
+    if (!isConnected) cancelRecognition();
+    setSpeechInterim(null);
+  }, [cancelRecognition, isConnected, recognitionEngine]);
 
   // [E] pickup -> seed message and call timer
   React.useEffect(() => {
@@ -384,7 +431,7 @@ export function Telephone(props: {
 
 
   // [E] continuous speech recognition (reload)
-  const shouldStartRecording = isConnected && !pushToTalk && speechInterim === null && !recognitionState.hasAudio;
+  const shouldStartRecording = isConnected && !pushToTalk && isMicEnabled && !recognitionState.isActive && !recognitionState.errorMessage;
   React.useEffect(() => {
     if (shouldStartRecording)
       startRecognition();
@@ -393,10 +440,9 @@ export function Telephone(props: {
 
   // more derived state
   const personaName = persona?.title ?? 'Unknown';
-  const isMicEnabled = recognitionState.isAvailable;
   const isTTSEnabled = true;
   const isEnabled = isMicEnabled && isTTSEnabled;
-  const micErrorMessage = recognitionState.errorMessage;
+  const micErrorMessage = recognitionState.errorMessage || (recognitionEngine === 'audioRecorder' && !transcriptionReady ? 'Configure a transcription engine and API key in Settings > Voice > Input.' : null);
 
 
   return <>
@@ -407,6 +453,7 @@ export function Telephone(props: {
     <OptimaPanelIn>
       <CallMenu
         pushToTalk={pushToTalk} setPushToTalk={setPushToTalk}
+        micBusy={recognitionState.isActive}
       />
     </OptimaPanelIn>
 
@@ -442,7 +489,7 @@ export function Telephone(props: {
           callerName={isConnected ? undefined : personaName}
           statusText={isRinging ? '' /*'is calling you'*/ : isDeclined ? 'call declined' : isEnded ? 'call ended' : callElapsedTime}
           regardingText={chatTitle}
-          micError={!isMicEnabled} micErrorMessage={micErrorMessage} speakError={!isTTSEnabled}
+          micError={!isMicEnabled || !!micErrorMessage} micErrorMessage={micErrorMessage} speakError={!isTTSEnabled}
         />
       </Box>
 
@@ -494,7 +541,7 @@ export function Telephone(props: {
               {/* Listening... */}
               {recognitionState.isActive && (
                 <CallMessage
-                  text={<>{speechInterim?.transcript.trim() || null}{speechInterim?.interimTranscript.trim() ? <i> {speechInterim.interimTranscript}</i> : null}</>}
+                  text={recognitionState.isStarting ? 'Opening microphone...' : recognitionState.isProcessing ? 'Transcribing...' : <>{speechInterim?.transcript.trim() || null}{speechInterim?.interimTranscript.trim() ? <i> {speechInterim.interimTranscript}</i> : null}</>}
                   variant={(recognitionState.hasSpeech || !!speechInterim?.transcript) ? 'soft' : 'outlined'}
                   color='primary'
                   role='user'
@@ -521,10 +568,11 @@ export function Telephone(props: {
 
       {/* [Calling] Hang / PTT (mute not enabled yet) */}
       {isConnected && <CallButton Icon={CallEndIcon} text='Hang up' color='danger' variant='soft' onClick={handleCallStop} />}
-      {isConnected && (pushToTalk ? (
+      {isConnected && (pushToTalk || recognitionState.errorMessage ? (
           <CallButton
-            Icon={MicIcon} onClick={toggleRecognition}
-            text={recognitionState.hasSpeech ? 'Listening...' : recognitionState.isActive ? 'Listening' : 'Push To Talk'}
+            Icon={MicIcon} onClick={handleToggleRecognition}
+            text={recognitionState.isStarting ? 'Opening microphone...' : recognitionState.isProcessing ? 'Transcribing...' : recognitionState.hasSpeech ? 'Listening...' : recognitionState.isActive ? 'Listening' : recognitionState.errorMessage ? 'Retry microphone' : 'Push To Talk'}
+            disabled={!isMicEnabled || recognitionState.isStarting || recognitionState.isProcessing}
             variant={recognitionState.hasSpeech ? 'solid' : recognitionState.isActive ? 'soft' : 'outlined'}
             color='primary'
             sx={!recognitionState.isActive ? { backgroundColor: 'background.surface' } : undefined}

@@ -1,184 +1,235 @@
-import { createSpeechRecognitionResults, IRecognitionEngine, SpeechDoneReason, SpeechRecognitionState, SpeechResult } from './useSpeechRecognition';
+import type { ASRxBatchResult } from '~/modules/asrx/asrx.types';
+
+import { createSpeechRecognitionResults, type IRecognitionEngine, type SpeechDoneReason, type SpeechRecognitionState, type SpeechResult, type SpeechResultCallback } from './speechRecognition.types';
 
 
-/**
- * Engine which uses the MediaRecorder API -> online Transcription for speech recognition.
- */
+// Bound each upload and avoid sending prolonged silence to a transcription model.
+const _sampleIntervalMs = 50;
+const _speechThreshold = 0.01;
+const _minSpeechMs = 150;
+const _noSpeechTimeoutMs = 30_000;
+const _maxRecordingMs = 120_000;
+const _transcriptionTimeoutMs = 60_000;
+
+type TranscribeAudio = (audio: Blob, mimeType: string, signal: AbortSignal) => Promise<ASRxBatchResult>;
+
+interface RecordingSession {
+  phase: 'starting' | 'recording' | 'processing';
+  controller: AbortController;
+  results: SpeechResult;
+  stream?: MediaStream;
+  recorder?: MediaRecorder;
+  context?: AudioContext;
+  timer?: ReturnType<typeof setInterval>;
+  deadline?: ReturnType<typeof setTimeout>;
+  chunks: BlobPart[];
+  heardSpeech: boolean;
+  speaking: boolean;
+  speechMs: number;
+  startedAt: number;
+  lastSpeechAt: number;
+}
+
+export function browserAudioRecordingAvailable(): boolean {
+  return typeof window !== 'undefined' && typeof MediaRecorder !== 'undefined'
+    && typeof AudioContext !== 'undefined' && !!navigator.mediaDevices?.getUserMedia;
+}
+
+
+/** Records one turn, then transcribes it with the configured ASRx engine. */
 export class AudioRecorderEngine implements IRecognitionEngine {
   public readonly engineType = 'audioRecorder';
 
-  // save parameters
-  private onResultCallback: (result: SpeechResult) => void;
-  private readonly setState: (state: Partial<SpeechRecognitionState>) => void;
-
-  // state
-  private _mediaRecorder: MediaRecorder | null = null;
-  private _mediaStream: MediaStream | null = null;
-  private audioChunks: BlobPart[] = [];
-  private results: SpeechResult = createSpeechRecognitionResults();
+  private session: RecordingSession | null = null;
+  private disposed = false;
 
   constructor(
-    _preferredLanguageIgnored: string,
-    _softStopTimeoutIgnored: number,
-    onResultCallback: (result: SpeechResult) => void,
-    setState: (state: Partial<SpeechRecognitionState>) => void,
+    private softStopTimeout: number,
+    private onResultCallback: SpeechResultCallback,
+    private readonly setState: (state: Partial<SpeechRecognitionState>) => void,
+    private readonly transcribe: TranscribeAudio,
   ) {
-    // Save parameters
-    this.setState = setState;
-    this.onResultCallback = onResultCallback;
-
-    // all ready
-    setState({ isAvailable: true });
+    setState({
+      isAvailable: browserAudioRecordingAvailable(),
+      ...(!browserAudioRecordingAvailable() ? { errorMessage: 'Audio recording requires a supported browser and HTTPS or localhost.' } : {}),
+    });
   }
 
-  async start() {
-    if (!navigator?.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      this.setState({ errorMessage: 'Media devices API not supported.' });
-      return;
-    }
-
-    // Initialize results
-    this.results = createSpeechRecognitionResults();
-    this.onResultCallback(this.results);
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          sampleRate: 48000,
-          sampleSize: 16,
-          channelCount: 1,
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        },
-      });
-      this._mediaStream = stream;
-      this._mediaRecorder = new MediaRecorder(stream);
-
-      this._mediaRecorder.onstart = () => {
-        this.setState({ isActive: true, hasAudio: true });
-        this.audioChunks = [];
-      };
-
-      this._mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0)
-          this.audioChunks.push(event.data);
-      };
-
-      this._mediaRecorder.onstop = async () => {
-        this.setState({ isActive: false, hasAudio: false });
-
-        // Stop all tracks to release microphone
-        if (this._mediaStream) {
-          this._mediaStream.getTracks().forEach(track => track.stop());
-          this._mediaStream = null;
-        }
-
-        // Transcribe audio
-        const audioBlob = new Blob(this.audioChunks, { type: 'audio/webm' });
-        await this._handleAudioBlob(audioBlob);
-
-        // Clean up MediaRecorder
-        if (this._mediaRecorder) {
-          this._mediaRecorder.onstart = null;
-          this._mediaRecorder.ondataavailable = null;
-          this._mediaRecorder.onstop = null;
-          this._mediaRecorder.onerror = null;
-          this._mediaRecorder = null;
-        }
-      };
-
-      this._mediaRecorder.onerror = (event) => {
-        console.error('AudioRecorderEngine error:', event);
-        this._handleError('Recording failed.');
-      };
-
-      this._mediaRecorder.start();
-    } catch (error: any) {
-      console.error('MediaDevices.getUserMedia error:', error);
-      this._handleError('Microphone access denied or not available.');
-    }
+  start() {
+    if (this.disposed || this.session) return;
+    const session: RecordingSession = {
+      phase: 'starting',
+      controller: new AbortController(),
+      results: createSpeechRecognitionResults(),
+      chunks: [],
+      heardSpeech: false,
+      speaking: false,
+      speechMs: 0,
+      startedAt: Date.now(),
+      lastSpeechAt: Date.now(),
+    };
+    this.session = session;
+    this.setState({ isActive: true, isStarting: true, isProcessing: false, hasAudio: false, hasSpeech: false, errorMessage: null });
+    this.onResultCallback(session.results);
+    void this._startRecording(session);
   }
 
   stop(reason: SpeechDoneReason, sendOnDone: boolean) {
-    this.results.doneReason = reason;
-    this.results.flagSendOnDone = sendOnDone;
+    const session = this.session;
+    if (!session) return;
+    if (reason === 'cancelled' || reason === 'switch-engine' || reason === 'react-unmount') {
+      this._finish(session, '', reason);
+      return;
+    }
+    if (session.phase === 'processing') return;
+    session.results.doneReason = reason;
+    session.results.flagSendOnDone = sendOnDone;
+    if (session.phase === 'starting') {
+      this._finish(session, '', reason);
+      return;
+    }
 
-    if (this._mediaRecorder && this._mediaRecorder.state === 'recording')
-      this._mediaRecorder.stop();
+    session.phase = 'processing';
+    this.setState({ isStarting: false, isProcessing: true, hasAudio: false, hasSpeech: false });
+    session.results.interimTranscript = 'Transcribing...';
+    this.onResultCallback(session.results);
+    session.recorder?.stop();
+    this._releaseCapture(session);
   }
 
   dispose() {
-    // if is running
-    if (this._mediaStream) {
-      this.results.doneReason = 'react-unmount';
-      this.stop(this.results.doneReason, false);
-      // Stop media streams
-      this._mediaStream.getTracks().forEach(track => track.stop());
-      this._mediaStream = null;
-    }
-
-    // Clean up MediaRecorder
-    if (this._mediaRecorder) {
-      if (this._mediaRecorder.state !== 'inactive')
-        this._mediaRecorder.stop();
-      this._mediaRecorder.onstart = null;
-      this._mediaRecorder.ondataavailable = null;
-      this._mediaRecorder.onstop = null;
-      this._mediaRecorder.onerror = null;
-      this._mediaRecorder = null;
-    }
+    this.disposed = true;
+    if (this.session) this._finish(this.session, '', 'react-unmount');
   }
 
   isBetweenBeginEnd() {
-    return !!this._mediaStream;
+    return this.session !== null;
   }
 
-  updateConfiguration(_language: string, _softStopTimeout: number, onResultCallback: (result: SpeechResult) => void) {
+  updateConfiguration(_language: string, softStopTimeout: number, onResultCallback: SpeechResultCallback) {
+    // ASRx owns the language, prompt and dictionary settings.
+    this.softStopTimeout = softStopTimeout;
     this.onResultCallback = onResultCallback;
   }
 
-  private async _handleAudioBlob(audioBlob: Blob) {
+  private async _startRecording(session: RecordingSession) {
     try {
-      this.results.transcript = await _transcribeDeepframFrontend(audioBlob);
-      this.results.interimTranscript = '';
-      this.results.done = true;
-      this.results.doneReason = this.results.doneReason ?? 'api-unknown-timeout';
-      this.onResultCallback(this.results);
-    } catch (error: any) {
-      console.error('Recognition error:', error);
-      this._handleError('Recognition failed: ' + error?.message);
+      // Resume in the initiating user gesture, before awaiting microphone access.
+      const context = session.context = new AudioContext();
+      const resumed = context.resume().catch(() => this._fail(session, 'Could not start microphone audio. Please try again.'));
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      if (this.session !== session) {
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
+      session.stream = stream;
+      await resumed;
+      if (this.session !== session) return;
+
+      const mimeType = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm', 'audio/ogg;codecs=opus']
+        .find(type => MediaRecorder.isTypeSupported(type));
+      const recorder = session.recorder = new MediaRecorder(stream, { ...(mimeType ? { mimeType } : {}), audioBitsPerSecond: 64_000 });
+      recorder.ondataavailable = (event) => {
+        if (this.session === session && event.data.size) session.chunks.push(event.data);
+      };
+      recorder.onerror = () => this._fail(session, 'Audio recording failed. Please try again.');
+      recorder.onstop = () => { void this._transcribe(session); };
+      stream.getTracks().forEach(track => {
+        track.onended = () => this._fail(session, 'Microphone disconnected. Please try again.');
+      });
+
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 2048;
+      context.createMediaStreamSource(stream).connect(analyser);
+      const samples = new Float32Array(analyser.fftSize);
+      session.phase = 'recording';
+      session.startedAt = Date.now();
+      recorder.start(1000);
+      this.setState({ isStarting: false, hasAudio: true });
+
+      session.timer = setInterval(() => {
+        if (this.session !== session || session.phase !== 'recording') return;
+        analyser.getFloatTimeDomainData(samples);
+        let energy = 0;
+        for (const sample of samples) energy += sample * sample;
+        const speaking = Math.sqrt(energy / samples.length) >= _speechThreshold;
+        const now = Date.now();
+        session.speechMs = speaking ? session.speechMs + _sampleIntervalMs : 0;
+        if (session.speechMs >= _minSpeechMs) session.heardSpeech = true;
+        if (speaking && session.heardSpeech) session.lastSpeechAt = now;
+        const detectedSpeech = speaking && session.heardSpeech;
+        if (session.speaking !== detectedSpeech) {
+          session.speaking = detectedSpeech;
+          this.setState({ hasSpeech: detectedSpeech });
+        }
+        if (!session.heardSpeech && now - session.startedAt >= _noSpeechTimeoutMs)
+          this._finish(session, '', 'api-no-speech');
+        else if (now - session.startedAt >= _maxRecordingMs
+          || (session.heardSpeech && !speaking && now - session.lastSpeechAt >= this.softStopTimeout))
+          this.stop('continuous-deadline', false);
+      }, _sampleIntervalMs);
+    } catch (error) {
+      this._fail(session, error instanceof Error ? error.message : 'Microphone access denied or not available.');
     }
   }
 
-  private _handleError(message: string) {
-    this.setState({ errorMessage: message });
-    this.results.doneReason = 'api-error';
-    this.results.done = true;
-    this.onResultCallback(this.results);
-    if (this._mediaRecorder && this._mediaRecorder.state === 'recording')
-      this._mediaRecorder.stop();
-    this.setState({ isActive: false, hasAudio: false });
+  private async _transcribe(session: RecordingSession) {
+    if (this.session !== session) return;
+    this._releaseCapture(session);
+    if (!session.heardSpeech || !session.chunks.length) {
+      this._finish(session, '', 'api-no-speech');
+      return;
+    }
+    const mimeType = session.recorder?.mimeType || 'audio/webm';
+    const audio = new Blob(session.chunks, { type: mimeType });
+    session.chunks = [];
+    session.deadline = setTimeout(() => this._fail(session, 'Transcription timed out. Please try again.'), _transcriptionTimeoutMs);
+    try {
+      const result = await this.transcribe(audio, mimeType, session.controller.signal);
+      if (this.session !== session) return;
+      if (!result.success) {
+        this._fail(session, result.errorText);
+        return;
+      }
+      this._finish(session, result.text, session.results.doneReason);
+    } catch (error) {
+      this._fail(session, error instanceof Error ? error.message : 'Transcription failed.');
+    }
   }
 
-}
-
-async function _transcribeDeepframFrontend(audioBlob: Blob): Promise<string> {
-  const formData = new FormData();
-  formData.append('file', audioBlob, 'audio.webm');
-
-  const response = await fetch('https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true', {
-    method: 'POST',
-    body: formData,
-    headers: {
-      'Authorization': 'Token YOUR_API_KEY_FROM_FRONTEND', // omitted
-      'Content-Type': 'audio/webm',
-    },
-  });
-  if (!response.ok) {
-    console.log('Transcription API failed:', response);
-    throw new Error('Transcription API failed: ' + response.statusText);
+  private _fail(session: RecordingSession, errorMessage: string) {
+    if (this.session !== session) return;
+    this.setState({ errorMessage });
+    this._finish(session, '', 'api-error');
   }
-  const { /*metadata,*/ results } = await response.json();
-  return results?.['channels']?.[0]?.['alternatives']?.[0]?.['transcript'] ?? '';
+
+  private _finish(session: RecordingSession, transcript: string, reason: SpeechDoneReason) {
+    if (this.session !== session) return;
+    this.session = null;
+    session.controller.abort();
+    if (session.deadline) clearTimeout(session.deadline);
+    if (session.recorder) {
+      session.recorder.ondataavailable = null;
+      session.recorder.onstop = null;
+      session.recorder.onerror = null;
+      if (session.recorder.state !== 'inactive') session.recorder.stop();
+    }
+    this._releaseCapture(session);
+    if (this.disposed) return;
+    this.setState({ isActive: false, isStarting: false, isProcessing: false, hasAudio: false, hasSpeech: false });
+    this.onResultCallback({ ...session.results, transcript, interimTranscript: '', done: true, doneReason: reason });
+  }
+
+  private _releaseCapture(session: RecordingSession) {
+    if (session.timer) clearInterval(session.timer);
+    session.stream?.getTracks().forEach(track => {
+      track.onended = null;
+      track.stop();
+    });
+    session.stream = undefined;
+    if (session.context) void session.context.close().catch(() => {});
+    session.context = undefined;
+  }
 }
