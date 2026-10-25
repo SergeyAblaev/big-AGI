@@ -43,18 +43,12 @@ export function messageOutcome(message: MessageOutcomeSource): DMessageOutcome {
 }
 
 export function messageTerminalOutcome(message: Omit<MessageOutcomeSource, 'pendingIncomplete'>): DMessageTerminalOutcome {
-  switch (message.generator?.tokenStopReason) {
-    case 'out-of-tokens':
-      return 'truncated';
-    case 'issue':
-    case 'filter':
-      return 'failed';
-    case 'client-abort':
-      return 'aborted';
-    case undefined:
-      break;
-    default:
-      return 'failed'; // forward-compat: a stop reason this build does not know is not a success
+  // Avoid an undefined switch arm: SWC 15.5.28 drops the normal completion path after it.
+  const stopReason = message.generator?.tokenStopReason;
+  if (stopReason !== undefined) {
+    if (stopReason === 'out-of-tokens') return 'truncated';
+    if (stopReason === 'client-abort') return 'aborted';
+    return 'failed'; // known errors and future stop reasons are not a success
   }
   // no stop reason (pre-stop-reason messages, clean ends without a finish reason): the last content fragment decides; trailing void notices do not weigh in
   for (let i = message.fragments.length - 1; i >= 0; i--) {

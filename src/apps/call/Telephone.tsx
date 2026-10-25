@@ -17,7 +17,7 @@ import { useChatMicTimeoutMsValue } from '../chat/store-app-chat';
 import { SystemPurposeId, SystemPurposes } from '../../data';
 
 import { aixChatGenerateContent_DMessage_FromConversation, AixChatGenerateContent_DMessageGuts } from '~/modules/aix/client/aix.client';
-import { speakText } from '~/modules/speex/speex.client';
+import { speakText, speakTextSurfaceFailure } from '~/modules/speex/speex.client';
 import { asrxAreCredentialsValid, useASRxGlobalEngine } from '~/modules/asrx/store-module-asrx';
 
 import type { FormRadioOption } from '~/common/components/forms/FormRadioControl';
@@ -312,7 +312,7 @@ export function Telephone(props: {
     void speakText(firstMessage,
       undefined,
       { label: 'Call', priority: 'fast' },
-    );
+    ).then(result => speakTextSurfaceFailure(result, 'call-speech-failed'));
 
     return () => clearInterval(interval);
   }, [isConnected, personaCallStarters]);
@@ -401,7 +401,7 @@ export function Telephone(props: {
         void speakText(finalText,
           undefined,
           { label: 'Call', priority: 'fast' },
-        );
+        ).then(result => speakTextSurfaceFailure(result, 'call-speech-failed'));
 
     }).catch((err: DOMException) => {
       if (err?.name !== 'AbortError') {
