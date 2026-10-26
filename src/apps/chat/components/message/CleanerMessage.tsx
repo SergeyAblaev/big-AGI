@@ -76,6 +76,10 @@ function analyzeMessageFragments(messageFragments: ReadonlyArray<DMessageFragmen
         case 'tool_response':
           result.toolCount++;
           break;
+        case 'hosted_resource':
+        case '_pt_sentinel':
+          // not counted
+          break;
       }
     } else if (isAttachmentFragment(fragment)) {
       if (isImagePart(fragment.part)) {
@@ -236,7 +240,7 @@ export function CleanerMessage(props: {
       : messageText.startsWith('/react ') ? 'react'
         : false;
 
-  const backgroundColor = messageBackground(messageRole, userCommandApprox, !!messageUpdated, isAssistantError ? 'danger' : messageOutcomeColor[messageOutcome(props.message)] === 'warning' ? 'warning' : undefined /* truncation only, as in chat */);
+  const backgroundColor = messageBackground(messageRole, userCommandApprox, !!messageUpdated, isAssistantError ? 'danger' : messageOutcomeColor(messageOutcome(props.message)) === 'warning' ? 'warning' : undefined /* truncation only, as in chat */);
 
   const avatarIconEl: React.JSX.Element | null = React.useMemo(() => {
     return makeMessageAvatarIcon('pro', messageRole, messageGeneratorName, messagePurposeId, !!messagePendingIncomplete, isUserMessageSkipped, false, false);

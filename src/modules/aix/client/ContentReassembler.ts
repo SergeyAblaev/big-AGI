@@ -24,7 +24,7 @@ import { aixClassifyReassemblyError } from './aix.client.errors';
 const DEBUG_FLOW = false; // logs client-side checkpoint/retry/continuation flow control
 const GENERATED_IMAGES_CONVERT_TO_COMPRESSED = true; // converts PNG to WebP or JPEG to save IndexedDB space
 const GENERATED_IMAGES_COMPRESSION_QUALITY = 0.98;
-const ELLIPSIZE_DEV_ISSUE_MESSAGES = 4096; // for _appendReassemblyDevError
+const ELLIPSIZE_DEV_ISSUE_MESSAGES = 4096; // for _appendReassemblyDevError and _appendUnknownParticleNotice
 const MERGE_ISSUES_INTO_TEXT_PART_IF_OPEN = false; // 2025-10-10: put errors in the dedicated part
 const VP_PERSISTENCE_DELAY = 500; // persistence of vision for voidPlaceholders
 
@@ -191,8 +191,9 @@ export class ContentReassembler {
 
     // Fragment finalization heuristics:
 
-    // - remove placeholders for clean exits, leave them for issues or client-aborts
-    if (this.S.terminationReason === 'done-dialect')
+    // - remove placeholders for clean exits, leave them for issues or client-aborts; a vendor stop reason is a clean exit
+    //   even when the end reason is not (a late issue, or a stream closed after the stop chunk)
+    if (vendorEnded || this.S.terminationReason === 'done-dialect')
       this._removeAllVoidPlaceholders(); // [PH-LIFECYCLE]
 
     // - mark active operations as errored on non-clean terminations
@@ -430,7 +431,7 @@ export class ContentReassembler {
           default:
             // noinspection JSUnusedLocalSymbols
             const _exhaustiveCheck: never = op;
-            this._appendReassemblyDevError(`unexpected PartParticleOp: ${JSON.stringify(op)}`);
+            this._appendUnknownParticleNotice(`unexpected PartParticleOp: ${JSON.stringify(op)}`);
         }
         break;
 
@@ -485,14 +486,14 @@ export class ContentReassembler {
           default:
             // noinspection JSUnusedLocalSymbols
             const _exhaustiveCheck: never = op;
-            this._appendReassemblyDevError(`unexpected ChatGenerateOp: ${JSON.stringify(op)}`);
+            this._appendUnknownParticleNotice(`unexpected ChatGenerateOp: ${JSON.stringify(op)}`);
         }
         break;
 
       default:
         // noinspection JSUnusedLocalSymbols
         const _exhaustiveCheck: never = op;
-        this._appendReassemblyDevError(`unexpected particle: ${JSON.stringify(op)}`);
+        this._appendUnknownParticleNotice(`unexpected particle: ${JSON.stringify(op)}`);
     }
   }
 
@@ -1129,11 +1130,10 @@ export class ContentReassembler {
     // -- Dialect-set dispatch terminations (model responded with an explicit stop reason at the end) --
 
     if (dialectTokenStopReason) {
-      // one row per wire reason, shared with the edge: GC_STOP_REASONS in aix.wiretypes
-      if (dialectTokenStopReason in AixWire_Particles.GC_STOP_REASONS) {
-        const { stored, message }: AixWire_Particles.GCStopReasonRow = AixWire_Particles.GC_STOP_REASONS[dialectTokenStopReason];
-        return { tsr: stored, ...(message && { errorMessage: message }) };
-      }
+      // one row per wire reason, shared with the edge: gcStopReasonRow in aix.wiretypes
+      const stopRow = AixWire_Particles.gcStopReasonRow(dialectTokenStopReason);
+      if (stopRow)
+        return { tsr: stopRow.stored, ...(stopRow.message && { errorMessage: stopRow.message }) };
       console.warn(`[ContentReassembler] Unmapped dialectStopReason: ${dialectTokenStopReason}. Falling back to terminationReason.`);
     }
 
@@ -1169,9 +1169,10 @@ export class ContentReassembler {
         return { tsr: 'issue' /* error fragments already added by upstream issue particles */ };
 
       default:
+        // a termination this build does not know (a newer server): completeness unknown, assumed complete, as above
         const _exhaustiveCheck: never = endReason;
         console.warn(`⚠️ [ContentReassembler] unmapped termination reason: ${endReason}`);
-        return { tsr: 'issue' };
+        return { tsr: undefined, notice: 'Response may be incomplete - the end reason is unknown to this version of the app.' };
     }
   }
 
@@ -1325,6 +1326,13 @@ export class ContentReassembler {
         errorText = ellipsizeMiddle(errorText, ELLIPSIZE_DEV_ISSUE_MESSAGES - truncationMessage.length, truncationMessage);
     }
     this._appendErrorFragment((omitPrefix ? '' : 'AIX Content Reassembler: ') + errorText);
+  }
+
+  /** A particle this build does not know (a newer server): a warn notice, not an error fragment - the response may well be complete. */
+  private _appendUnknownParticleNotice(particleText: string): void {
+    console.warn(`⚠️ [ContentReassembler] ${particleText}`);
+    this.S._textFragmentIndex = null;
+    this._pushFragment(createPlaceholderVoidFragment('Part of the response is unknown to this version of the app.', 'notice', undefined, undefined, ellipsizeMiddle(particleText, ELLIPSIZE_DEV_ISSUE_MESSAGES, ' ... '), undefined, 'warn'));
   }
 
   private _appendErrorFragment(errorText: string, errorHint?: DMessageErrorPart['hint']): void {
